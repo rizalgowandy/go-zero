@@ -2,15 +2,11 @@ package migrationnotes
 
 import (
 	"fmt"
-	"io/ioutil"
+	"os"
 	"strings"
-
-	"github.com/urfave/cli"
 )
 
-func migrateBefore1_3_4(ctx *cli.Context) error {
-	dir := ctx.String("dir")
-	style := ctx.String("style")
+func migrateBefore1_3_4(dir, style string) error {
 	ok, err := needShow1_3_4(dir, style)
 	if err != nil {
 		return err
@@ -28,7 +24,7 @@ func migrateBefore1_3_4(ctx *cli.Context) error {
 }
 
 func needShow1_3_4(dir, style string) (bool, error) {
-	files, err := ioutil.ReadDir(dir)
+	files, err := os.ReadDir(dir)
 	if err != nil {
 		return false, nil
 	}
@@ -53,5 +49,4 @@ func needShow1_3_4(dir, style string) (bool, error) {
 		}
 	}
 	return false, nil
-
 }

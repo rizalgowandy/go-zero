@@ -2,6 +2,7 @@ package internal
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"sort"
@@ -9,12 +10,14 @@ import (
 	"sync"
 	"time"
 
+	"go.etcd.io/etcd/api/v3/v3rpc/rpctypes"
+	clientv3 "go.etcd.io/etcd/client/v3"
+
 	"github.com/zeromicro/go-zero/core/contextx"
 	"github.com/zeromicro/go-zero/core/lang"
 	"github.com/zeromicro/go-zero/core/logx"
 	"github.com/zeromicro/go-zero/core/syncx"
 	"github.com/zeromicro/go-zero/core/threading"
-	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
 var (
@@ -22,12 +25,13 @@ var (
 		clusters: make(map[string]*cluster),
 	}
 	connManager = syncx.NewResourceManager()
+	errClosed   = errors.New("etcd monitor chan has been closed")
 )
 
 // A Registry is a registry that manages the etcd client connections.
 type Registry struct {
 	clusters map[string]*cluster
-	lock     sync.Mutex
+	lock     sync.RWMutex
 }
 
 // GetRegistry returns a global Registry.
@@ -42,7 +46,7 @@ func (r *Registry) GetConn(endpoints []string) (EtcdClient, error) {
 }
 
 // Monitor monitors the key on given etcd endpoints, notify with the given UpdateListener.
-func (r *Registry) Monitor(endpoints []string, key string, l UpdateListener) error {
+func (r *Registry) Monitor(endpoints []string, key string, l UpdateListener, exactMatch bool) error {
 	c, exists := r.getCluster(endpoints)
 	// if exists, the existing values should be updated to the listener.
 	if exists {
@@ -52,17 +56,24 @@ func (r *Registry) Monitor(endpoints []string, key string, l UpdateListener) err
 		}
 	}
 
-	return c.monitor(key, l)
+	return c.monitor(key, l, exactMatch)
 }
 
 func (r *Registry) getCluster(endpoints []string) (c *cluster, exists bool) {
 	clusterKey := getClusterKey(endpoints)
-	r.lock.Lock()
-	defer r.lock.Unlock()
+	r.lock.RLock()
 	c, exists = r.clusters[clusterKey]
+	r.lock.RUnlock()
+
 	if !exists {
-		c = newCluster(endpoints)
-		r.clusters[clusterKey] = c
+		r.lock.Lock()
+		defer r.lock.Unlock()
+		// double-check locking
+		c, exists = r.clusters[clusterKey]
+		if !exists {
+			c = newCluster(endpoints)
+			r.clusters[clusterKey] = c
+		}
 	}
 
 	return
@@ -75,7 +86,8 @@ type cluster struct {
 	listeners  map[string][]UpdateListener
 	watchGroup *threading.RoutineGroup
 	done       chan lang.PlaceholderType
-	lock       sync.Mutex
+	lock       sync.RWMutex
+	exactMatch bool
 }
 
 func newCluster(endpoints []string) *cluster {
@@ -105,8 +117,8 @@ func (c *cluster) getClient() (EtcdClient, error) {
 }
 
 func (c *cluster) getCurrent(key string) []KV {
-	c.lock.Lock()
-	defer c.lock.Unlock()
+	c.lock.RLock()
+	defer c.lock.RUnlock()
 
 	var kvs []KV
 	for k, v := range c.values[key] {
@@ -122,6 +134,7 @@ func (c *cluster) getCurrent(key string) []KV {
 func (c *cluster) handleChanges(key string, kvs []KV) {
 	var add []KV
 	var remove []KV
+
 	c.lock.Lock()
 	listeners := append([]UpdateListener(nil), c.listeners[key]...)
 	vals, ok := c.values[key]
@@ -170,9 +183,9 @@ func (c *cluster) handleChanges(key string, kvs []KV) {
 }
 
 func (c *cluster) handleWatchEvents(key string, events []*clientv3.Event) {
-	c.lock.Lock()
+	c.lock.RLock()
 	listeners := append([]UpdateListener(nil), c.listeners[key]...)
-	c.lock.Unlock()
+	c.lock.RUnlock()
 
 	for _, ev := range events {
 		switch ev.Type {
@@ -191,9 +204,11 @@ func (c *cluster) handleWatchEvents(key string, events []*clientv3.Event) {
 				})
 			}
 		case clientv3.EventTypeDelete:
+			c.lock.Lock()
 			if vals, ok := c.values[key]; ok {
 				delete(vals, string(ev.Kv.Key))
 			}
+			c.lock.Unlock()
 			for _, l := range listeners {
 				l.OnDelete(KV{
 					Key: string(ev.Kv.Key),
@@ -206,18 +221,23 @@ func (c *cluster) handleWatchEvents(key string, events []*clientv3.Event) {
 	}
 }
 
-func (c *cluster) load(cli EtcdClient, key string) {
+func (c *cluster) load(cli EtcdClient, key string) int64 {
 	var resp *clientv3.GetResponse
 	for {
 		var err error
 		ctx, cancel := context.WithTimeout(c.context(cli), RequestTimeout)
-		resp, err = cli.Get(ctx, makeKeyPrefix(key), clientv3.WithPrefix())
+		if c.exactMatch {
+			resp, err = cli.Get(ctx, key)
+		} else {
+			resp, err = cli.Get(ctx, makeKeyPrefix(key), clientv3.WithPrefix())
+		}
+
 		cancel()
 		if err == nil {
 			break
 		}
 
-		logx.Error(err)
+		logx.Errorf("%s, key is %s", err.Error(), key)
 		time.Sleep(coolDownInterval)
 	}
 
@@ -230,11 +250,14 @@ func (c *cluster) load(cli EtcdClient, key string) {
 	}
 
 	c.handleChanges(key, kvs)
+
+	return resp.Header.Revision
 }
 
-func (c *cluster) monitor(key string, l UpdateListener) error {
+func (c *cluster) monitor(key string, l UpdateListener, exactMatch bool) error {
 	c.lock.Lock()
 	c.listeners[key] = append(c.listeners[key], l)
+	c.exactMatch = exactMatch
 	c.lock.Unlock()
 
 	cli, err := c.getClient()
@@ -242,9 +265,9 @@ func (c *cluster) monitor(key string, l UpdateListener) error {
 		return err
 	}
 
-	c.load(cli, key)
+	rev := c.load(cli, key)
 	c.watchGroup.Run(func() {
-		c.watch(cli, key)
+		c.watch(cli, key, rev)
 	})
 
 	return nil
@@ -276,41 +299,61 @@ func (c *cluster) reload(cli EtcdClient) {
 	for _, key := range keys {
 		k := key
 		c.watchGroup.Run(func() {
-			c.load(cli, k)
-			c.watch(cli, k)
+			rev := c.load(cli, k)
+			c.watch(cli, k, rev)
 		})
 	}
 }
 
-func (c *cluster) watch(cli EtcdClient, key string) {
+func (c *cluster) watch(cli EtcdClient, key string, rev int64) {
 	for {
-		if c.watchStream(cli, key) {
+		err := c.watchStream(cli, key, rev)
+		if err == nil {
 			return
 		}
+
+		if rev != 0 && errors.Is(err, rpctypes.ErrCompacted) {
+			logx.Errorf("etcd watch stream has been compacted, try to reload, rev %d", rev)
+			rev = c.load(cli, key)
+		}
+
+		// log the error and retry
+		logx.Error(err)
 	}
 }
 
-func (c *cluster) watchStream(cli EtcdClient, key string) bool {
-	rch := cli.Watch(clientv3.WithRequireLeader(c.context(cli)), makeKeyPrefix(key), clientv3.WithPrefix())
+func (c *cluster) watchStream(cli EtcdClient, key string, rev int64) error {
+	var (
+		rch      clientv3.WatchChan
+		ops      []clientv3.OpOption
+		watchKey = key
+	)
+	if !c.exactMatch {
+		watchKey = makeKeyPrefix(key)
+		ops = append(ops, clientv3.WithPrefix())
+	}
+	if rev != 0 {
+		ops = append(ops, clientv3.WithRev(rev+1))
+	}
+
+	rch = cli.Watch(clientv3.WithRequireLeader(c.context(cli)), watchKey, ops...)
+
 	for {
 		select {
 		case wresp, ok := <-rch:
 			if !ok {
-				logx.Error("etcd monitor chan has been closed")
-				return false
+				return errClosed
 			}
 			if wresp.Canceled {
-				logx.Errorf("etcd monitor chan has been canceled, error: %v", wresp.Err())
-				return false
+				return fmt.Errorf("etcd monitor chan has been canceled, error: %w", wresp.Err())
 			}
 			if wresp.Err() != nil {
-				logx.Error(fmt.Sprintf("etcd monitor chan error: %v", wresp.Err()))
-				return false
+				return fmt.Errorf("etcd monitor chan error: %w", wresp.Err())
 			}
 
 			c.handleWatchEvents(key, wresp.Events)
 		case <-c.done:
-			return true
+			return nil
 		}
 	}
 }
@@ -326,12 +369,11 @@ func (c *cluster) watchConnState(cli EtcdClient) {
 // DialClient dials an etcd cluster with given endpoints.
 func DialClient(endpoints []string) (EtcdClient, error) {
 	cfg := clientv3.Config{
-		Endpoints:            endpoints,
-		AutoSyncInterval:     autoSyncInterval,
-		DialTimeout:          DialTimeout,
-		DialKeepAliveTime:    dialKeepAliveTime,
-		DialKeepAliveTimeout: DialTimeout,
-		RejectOldCluster:     true,
+		Endpoints:           endpoints,
+		AutoSyncInterval:    autoSyncInterval,
+		DialTimeout:         DialTimeout,
+		RejectOldCluster:    true,
+		PermitWithoutStream: true,
 	}
 	if account, ok := GetAccount(endpoints); ok {
 		cfg.Username = account.User
