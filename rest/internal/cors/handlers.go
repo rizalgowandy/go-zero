@@ -2,6 +2,7 @@ package cors
 
 import (
 	"net/http"
+	"strings"
 
 	"github.com/zeromicro/go-zero/rest/internal/response"
 )
@@ -24,6 +25,11 @@ const (
 	varyHeader       = "Vary"
 	originHeader     = "Origin"
 )
+
+// AddAllowHeaders sets the allowed headers.
+func AddAllowHeaders(header http.Header, headers ...string) {
+	header.Add(allowHeaders, strings.Join(headers, ", "))
+}
 
 // NotAllowedHandler handles cross domain not allowed requests.
 // At most one origin can be specified, other origins are ignored if given, default to be *.
@@ -76,12 +82,19 @@ func checkAndSetHeaders(w http.ResponseWriter, r *http.Request, origins []string
 }
 
 func isOriginAllowed(allows []string, origin string) bool {
-	for _, o := range allows {
-		if o == allOrigins {
+	origin = strings.ToLower(origin)
+
+	for _, allow := range allows {
+		if allow == allOrigins {
 			return true
 		}
 
-		if o == origin {
+		allow = strings.ToLower(allow)
+		if origin == allow {
+			return true
+		}
+
+		if strings.HasSuffix(origin, "."+allow) {
 			return true
 		}
 	}

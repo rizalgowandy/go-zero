@@ -1,9 +1,14 @@
 package internal
 
 import (
-	"github.com/zeromicro/go-zero/core/stat"
+	"time"
+
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/health"
+	"google.golang.org/grpc/keepalive"
 )
+
+const defaultConnectionIdleDuration = time.Minute * 5
 
 type (
 	// RegisterFn defines the method to register a server.
@@ -20,7 +25,7 @@ type (
 
 	baseRpcServer struct {
 		address            string
-		metrics            *stat.Metrics
+		health             *health.Server
 		options            []grpc.ServerOption
 		streamInterceptors []grpc.StreamServerInterceptor
 		unaryInterceptors  []grpc.UnaryServerInterceptor
@@ -28,9 +33,16 @@ type (
 )
 
 func newBaseRpcServer(address string, rpcServerOpts *rpcServerOptions) *baseRpcServer {
+	var h *health.Server
+	if rpcServerOpts.health {
+		h = health.NewServer()
+	}
 	return &baseRpcServer{
 		address: address,
-		metrics: rpcServerOpts.metrics,
+		health:  h,
+		options: []grpc.ServerOption{grpc.KeepaliveParams(keepalive.ServerParameters{
+			MaxConnectionIdle: defaultConnectionIdleDuration,
+		})},
 	}
 }
 
@@ -44,8 +56,4 @@ func (s *baseRpcServer) AddStreamInterceptors(interceptors ...grpc.StreamServerI
 
 func (s *baseRpcServer) AddUnaryInterceptors(interceptors ...grpc.UnaryServerInterceptor) {
 	s.unaryInterceptors = append(s.unaryInterceptors, interceptors...)
-}
-
-func (s *baseRpcServer) SetName(name string) {
-	s.metrics.SetName(name)
 }

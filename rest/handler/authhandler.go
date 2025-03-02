@@ -7,7 +7,7 @@ import (
 	"net/http/httputil"
 
 	"github.com/golang-jwt/jwt/v4"
-	"github.com/zeromicro/go-zero/core/logx"
+	"github.com/zeromicro/go-zero/core/logc"
 	"github.com/zeromicro/go-zero/rest/internal/response"
 	"github.com/zeromicro/go-zero/rest/token"
 )
@@ -29,7 +29,7 @@ var (
 )
 
 type (
-	// A AuthorizeOptions is authorize options.
+	// An AuthorizeOptions is authorize options.
 	AuthorizeOptions struct {
 		PrevSecret string
 		Callback   UnauthorizedCallback
@@ -41,7 +41,7 @@ type (
 	AuthorizeOption func(opts *AuthorizeOptions)
 )
 
-// Authorize returns an authorize middleware.
+// Authorize returns an authorization middleware.
 func Authorize(secret string, opts ...AuthorizeOption) func(http.Handler) http.Handler {
 	var authOpts AuthorizeOptions
 	for _, opt := range opts {
@@ -100,7 +100,7 @@ func WithUnauthorizedCallback(callback UnauthorizedCallback) AuthorizeOption {
 func detailAuthLog(r *http.Request, reason string) {
 	// discard dump error, only for debug purpose
 	details, _ := httputil.DumpRequest(r, true)
-	logx.Errorf("authorize failed: %s\n=> %+v", reason, string(details))
+	logc.Errorf(r.Context(), "authorize failed: %s\n=> %+v", reason, string(details))
 }
 
 func unauthorized(w http.ResponseWriter, r *http.Request, err error, callback UnauthorizedCallback) {
